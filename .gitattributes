@@ -1,2 +1,5 @@
 # Normalize EOL for all files that Git considers text files.
 * text=auto eol=lf
+
+# Vendored native binaries: never touch line endings (macOS framework plists are code-signed)
+addons/godot-sqlite/bin/** -text

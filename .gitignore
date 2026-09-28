@@ -5,8 +5,10 @@
 .godot/
 /android/
 
-# godot-sqlite platform binaries — install from the godot-sqlite GitHub release (see README)
-addons/godot-sqlite/bin/
+# godot-sqlite iOS binaries — 286 MB of xcframeworks, far too large to vendor.
+# Install godot-sqlite from its GitHub release if you are exporting to iOS.
+addons/godot-sqlite/bin/*.ios.*
+addons/godot-sqlite/bin/libgodot-cpp.ios.*
 
 # Bindings generated from your own Tarinoi project's schema — created by
 # Tools > Tarinoi: Regenerate Bindings after syncing. Not portable between projects.
