@@ -1,0 +1,399 @@
+@tool
+extends EditorPlugin
+
+const CREDENTIALS_PATH := "user://tarinoi/.credentials"
+
+var _api_importer: TarinoiApiImporter = null
+var _export_plugin: EditorExportPlugin = null
+
+
+func _enter_tree() -> void:
+	_register_settings()
+	add_autoload_singleton("TarinoiRuntime", "res://addons/tarinoi/autoload/TarinoiRuntime.gd")
+	add_tool_menu_item("Tarinoi: Initialize project",       _on_initialize_pressed)
+	add_tool_menu_item("Tarinoi: Sync",                     _on_sync_pressed)
+	add_tool_menu_item("Tarinoi: Snapshot for Export",      _on_snapshot_pressed)
+	add_tool_menu_item("Tarinoi: Regenerate Bindings",      _on_regen_pressed)
+	add_tool_menu_item("Tarinoi: Validate Bindings",        _on_validate_pressed)
+	add_tool_menu_item("Tarinoi: Set Tarinoi API token…",   _on_set_api_key_pressed)
+	add_tool_menu_item("Tarinoi: Clear local data",         _on_clear_data_pressed)
+	_export_plugin = preload("res://addons/tarinoi/export_plugin.gd").new()
+	add_export_plugin(_export_plugin)
+
+
+func _exit_tree() -> void:
+	remove_autoload_singleton("TarinoiRuntime")
+	remove_tool_menu_item("Tarinoi: Initialize project")
+	remove_tool_menu_item("Tarinoi: Sync")
+	remove_tool_menu_item("Tarinoi: Snapshot for Export")
+	remove_tool_menu_item("Tarinoi: Regenerate Bindings")
+	remove_tool_menu_item("Tarinoi: Validate Bindings")
+	remove_tool_menu_item("Tarinoi: Set Tarinoi API token…")
+	remove_tool_menu_item("Tarinoi: Clear local data")
+	remove_export_plugin(_export_plugin)
+	_export_plugin = null
+
+
+# ---------------------------------------------------------------------------
+# Initialize project
+# ---------------------------------------------------------------------------
+
+func _on_initialize_pressed() -> void:
+	var tscn_dest := "res://tarinoi_quickstart.tscn"
+	var gd_dest   := "res://tarinoi_quickstart.gd"
+
+	if ResourceLoader.exists(tscn_dest):
+		var d := AcceptDialog.new()
+		d.title = "Tarinoi: Initialize"
+		d.dialog_text = "res://tarinoi_quickstart.tscn already exists.\n\nDelete it first if you want to reinitialize."
+		d.min_size = Vector2i(420, 0)
+		EditorInterface.get_base_control().add_child(d)
+		d.popup_centered()
+		d.confirmed.connect(d.queue_free)
+		return
+
+	var tscn_content := """[gd_scene format=3]
+
+[ext_resource type="PackedScene" path="res://addons/tarinoi/scenes/tarinoi_quickstart.tscn" id="1"]
+[ext_resource type="Script" path="res://tarinoi_quickstart.gd" id="2"]
+
+[node name="TarinoiQuickStart" instance=ExtResource("1")]
+script = ExtResource("2")
+"""
+	var tscn_file := FileAccess.open(tscn_dest, FileAccess.WRITE)
+	if tscn_file == null:
+		TarinoiLogger.error("failed to write " + tscn_dest)
+		return
+	tscn_file.store_string(tscn_content)
+	tscn_file = null
+
+	var gd_content := """extends "res://addons/tarinoi/scenes/tarinoi_quickstart.gd"
+
+
+## Override this to register your game's bindings before sync runs.
+## Example:
+##   func _setup_bindings() -> void:
+##       var vars := MyVariables.new()
+##       TarinoiRuntime.registry.bind_variable_collection("global", vars)
+##       TarinoiRuntime.registry.bind_function_collection("global", MyFunctions.new(vars))
+func _setup_bindings() -> void:
+\tpass
+"""
+	var gd_file := FileAccess.open(gd_dest, FileAccess.WRITE)
+	if gd_file == null:
+		TarinoiLogger.error("failed to write " + gd_dest)
+		return
+	gd_file.store_string(gd_content)
+	gd_file = null
+
+	EditorInterface.get_resource_filesystem().scan()
+
+	var d := AcceptDialog.new()
+	d.title = "Tarinoi: Initialize"
+	d.dialog_text = "Created:\n  res://tarinoi_quickstart.tscn\n  res://tarinoi_quickstart.gd\n\nSet res://tarinoi_quickstart.tscn as your main scene (Project > Project Settings > Application > Run > Main Scene) and press Play."
+	d.min_size = Vector2i(500, 0)
+	EditorInterface.get_base_control().add_child(d)
+	d.popup_centered()
+	d.confirmed.connect(d.queue_free)
+
+
+# ---------------------------------------------------------------------------
+# Sync
+# ---------------------------------------------------------------------------
+
+func _on_sync_pressed() -> void:
+	var api_path: String = ProjectSettings.get_setting("tarinoi/api/path", "")
+	if api_path.is_empty():
+		TarinoiLogger.error("set tarinoi/api/path in Project Settings first")
+		return
+	_api_importer = TarinoiApiImporter.new()
+	_api_importer.sync_started.connect(func(): TarinoiLogger.info("sync started…"))
+	_api_importer.sync_progress.connect(func(msg, _f): TarinoiLogger.info(msg))
+	_api_importer.sync_completed.connect(func(stats: Dictionary):
+		TarinoiLogger.info("sync complete — %s" % stats)
+		if ProjectSettings.get_setting("tarinoi/codegen/on_sync", false):
+			var db := _open_db()
+			if db:
+				TarinoiCodegen.new().run(db)
+				db.close()
+	)
+	_api_importer.sync_failed.connect(func(reason): TarinoiLogger.error("sync failed — " + reason))
+	_api_importer.sync(api_path)
+
+
+# ---------------------------------------------------------------------------
+# Snapshot for Export
+# ---------------------------------------------------------------------------
+
+func _on_snapshot_pressed() -> void:
+	var project_id := _project_id()
+	if project_id.is_empty():
+		return
+
+	var src := ProjectSettings.globalize_path("user://tarinoi/" + project_id + ".db")
+	if not FileAccess.file_exists(src):
+		TarinoiLogger.error("no local DB at '%s' — run Sync first" % src)
+		return
+
+	var dest_dir := "res://tarinoi/bundled"
+	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(dest_dir))
+
+	var bytes := FileAccess.get_file_as_bytes(src)
+	if bytes.is_empty():
+		TarinoiLogger.error("could not read source DB at '%s'" % src)
+		return
+
+	var dest_path := dest_dir + "/" + project_id + ".db"
+	var wf := FileAccess.open(dest_path, FileAccess.WRITE)
+	if wf == null:
+		TarinoiLogger.error("could not write snapshot to '%s'" % dest_path)
+		return
+	wf.store_buffer(bytes)
+	wf = null  # close before reopening with SQLite
+
+	# Scrub development-environment metadata from the snapshot.
+	# api_path and api_sync_cursor are dev artifacts with no place in an offline build.
+	var abs_dest := ProjectSettings.globalize_path(dest_path)
+	var scrub := SQLite.new()
+	scrub.path = abs_dest
+	scrub.verbosity_level = SQLite.QUIET
+	if scrub.open_db():
+		scrub.query("DELETE FROM metadata WHERE key IN ('api_path', 'api_sync_cursor')")
+		scrub.close_db()
+
+	TarinoiLogger.info("snapshot written — %d bytes → '%s'" % [bytes.size(), dest_path])
+
+
+# ---------------------------------------------------------------------------
+# Codegen
+# ---------------------------------------------------------------------------
+
+func _on_regen_pressed() -> void:
+	var db := _open_db()
+	if db == null:
+		return
+	TarinoiCodegen.new().run(db)
+	db.close()
+
+
+func _on_validate_pressed() -> void:
+	var db := _open_db()
+	if db == null:
+		return
+	TarinoiCodegen.new().validate_only(db)
+	db.close()
+
+
+func _open_db() -> TarinoiDB:
+	var project_id := _project_id()
+	if project_id.is_empty():
+		return null
+	var db := TarinoiDB.new()
+	if not db.open(project_id):
+		TarinoiLogger.error("failed to open DB for project '%s' — run Sync first" % project_id)
+		return null
+	return db
+
+
+## The DB slug, derived from the configured API path. Reports the reason and
+## returns "" when it cannot be derived, so callers can simply bail on empty.
+func _project_id() -> String:
+	var api_path: String = ProjectSettings.get_setting("tarinoi/api/path", "")
+	if api_path.is_empty():
+		TarinoiLogger.error("set tarinoi/api/path in Project Settings first")
+		return ""
+	var project_id := api_path.trim_suffix("/").trim_suffix("/documents").get_file()
+	if project_id.is_empty():
+		TarinoiLogger.error("cannot derive a project id from tarinoi/api/path '%s'" % api_path)
+	return project_id
+
+
+# ---------------------------------------------------------------------------
+# Set API token dialog
+# ---------------------------------------------------------------------------
+
+func _on_set_api_key_pressed() -> void:
+	_show_credential_dialog(
+		"Tarinoi: Set API Key",
+		"Enter your Tarinoi REST API key.",
+		"API key already saved. Enter a new value to replace it.",
+		"Paste the key from your Tarinoi profile",
+		"api_key"
+	)
+
+
+func _show_credential_dialog(title: String, prompt_new: String, prompt_existing: String,
+		placeholder: String, cred_key: String) -> void:
+	var dialog := ConfirmationDialog.new()
+	dialog.title = title
+
+	var has_key := _credential_is_saved(cred_key)
+	dialog.dialog_text = prompt_existing if has_key else prompt_new
+
+	var input := LineEdit.new()
+	input.secret = true
+	input.placeholder_text = placeholder
+	input.custom_minimum_size = Vector2i(520, 32)
+	dialog.add_child(input)
+
+	EditorInterface.get_base_control().add_child(dialog)
+	dialog.popup_centered()
+
+	dialog.confirmed.connect(func():
+		var value := input.text.strip_edges()
+		if not value.is_empty():
+			_save_credential(cred_key, value)
+			_refresh_credential_status()
+		dialog.queue_free()
+	)
+	dialog.canceled.connect(func(): dialog.queue_free())
+
+
+# ---------------------------------------------------------------------------
+# Clear local data
+# ---------------------------------------------------------------------------
+
+func _on_clear_data_pressed() -> void:
+	var project_id := _project_id()
+	if project_id.is_empty():
+		return
+
+	var db_path := ProjectSettings.globalize_path("user://tarinoi/" + project_id + ".db")
+	if FileAccess.file_exists(db_path):
+		DirAccess.remove_absolute(db_path)
+		TarinoiLogger.info("removed DB — " + db_path)
+	TarinoiLogger.info("local data cleared for project '%s'" % project_id)
+
+
+# ---------------------------------------------------------------------------
+# Credentials helpers
+# ---------------------------------------------------------------------------
+
+func _save_credential(key: String, value: String) -> void:
+	DirAccess.make_dir_recursive_absolute(
+		ProjectSettings.globalize_path("user://tarinoi")
+	)
+	# Read existing lines, replace matching key or append.
+	var lines: PackedStringArray = PackedStringArray()
+	var found := false
+	if FileAccess.file_exists(CREDENTIALS_PATH):
+		var rf := FileAccess.open(CREDENTIALS_PATH, FileAccess.READ)
+		if rf:
+			while not rf.eof_reached():
+				var line := rf.get_line()
+				if line.strip_edges().to_lower().begins_with(key.to_lower() + "="):
+					lines.append(key + "=" + value)
+					found = true
+				else:
+					lines.append(line)
+	if not found:
+		lines.append(key + "=" + value)
+
+	var wf := FileAccess.open(CREDENTIALS_PATH, FileAccess.WRITE)
+	if wf == null:
+		TarinoiLogger.error("failed to write credentials file")
+		return
+	for line in lines:
+		if not line.strip_edges().is_empty():
+			wf.store_line(line)
+	TarinoiLogger.info("saved credential '%s'" % key)
+
+
+func _credential_is_saved(key: String) -> bool:
+	if not FileAccess.file_exists(CREDENTIALS_PATH):
+		return false
+	var file := FileAccess.open(CREDENTIALS_PATH, FileAccess.READ)
+	if file == null:
+		return false
+	var prefix := key.to_lower() + "="
+	while not file.eof_reached():
+		if file.get_line().strip_edges().to_lower().begins_with(prefix):
+			return true
+	return false
+
+
+
+# ---------------------------------------------------------------------------
+# ProjectSettings
+# ---------------------------------------------------------------------------
+
+## Settings from removed features. A project that enabled an earlier plugin
+## still carries them in project.godot, where they show up as a stray "Git"
+## group in Project Settings > Tarinoi. Erase them once, on load.
+const _OBSOLETE_SETTINGS := [
+	"tarinoi/git/token", "tarinoi/git/repo_url", "tarinoi/sync_source", "tarinoi/auto_sync",
+]
+
+
+func _register_settings() -> void:
+	var erased := false
+	for name: String in _OBSOLETE_SETTINGS:
+		if ProjectSettings.has_setting(name):
+			ProjectSettings.set_setting(name, null)
+			erased = true
+	if erased:
+		ProjectSettings.save()
+
+	# API sync
+	_add_setting("tarinoi/api/path",            TYPE_STRING, "")
+	_add_ro_credential_field("tarinoi/api/token")
+	_add_setting("tarinoi/api/ca_certificate",  TYPE_STRING, "")
+	_add_setting("tarinoi/api/skip_tls_verify", TYPE_BOOL,   false)
+	_add_setting("tarinoi/api/poll_enabled",    TYPE_BOOL,   false)
+	_add_setting("tarinoi/api/poll_interval",   TYPE_INT,    10)
+
+	# Codegen
+	_add_setting("tarinoi/codegen/output_path", TYPE_STRING, "res://bindings/generated/")
+	_add_setting("tarinoi/codegen/impl_path",   TYPE_STRING, "res://bindings/impl/")
+	_add_setting("tarinoi/codegen/on_sync",     TYPE_BOOL,   false)
+
+	# Behaviour
+	_add_setting("tarinoi/behaviour/committed_only",  TYPE_BOOL, false)
+	_add_setting("tarinoi/behaviour/log_level",       TYPE_INT,  TarinoiLogger.Level.INFO)
+	ProjectSettings.add_property_info({
+		"name":        "tarinoi/behaviour/log_level",
+		"type":        TYPE_INT,
+		"hint":        PROPERTY_HINT_ENUM,
+		"hint_string": "DEBUG:0,INFO:1,WARN:2,ERROR:3,OFF:4",
+	})
+	_add_setting("tarinoi/behaviour/offline_mode",    TYPE_BOOL, false)
+
+	# Advanced
+	_add_setting("tarinoi/data_provider", TYPE_STRING, "")
+	ProjectSettings.add_property_info({
+		"name": "tarinoi/data_provider",
+		"type": TYPE_STRING,
+		"hint": PROPERTY_HINT_FILE,
+		"hint_string": "*.gd",
+	})
+
+	_refresh_credential_status()
+
+
+func _refresh_credential_status() -> void:
+	var api_status := "saved — change via Tools > Tarinoi: Set Tarinoi API token…" \
+		if _credential_is_saved("api_key") \
+		else "not set — use Tools > Tarinoi: Set Tarinoi API token…"
+	ProjectSettings.set_setting("tarinoi/api/token", api_status)
+
+
+func _add_ro_credential_field(name: String) -> void:
+	if not ProjectSettings.has_setting(name):
+		ProjectSettings.set_setting(name, "")
+	ProjectSettings.set_initial_value(name, "")
+	# "usage" in add_property_info() was silently dropped in Godot 4.7 — this field
+	# is no longer enforced read-only in the Project Settings UI. Harmless: it's
+	# just a status display, and _refresh_credential_status() overwrites it on
+	# every plugin reload regardless of manual edits.
+	ProjectSettings.add_property_info({
+		"name": name,
+		"type": TYPE_STRING,
+		"hint": PROPERTY_HINT_NONE,
+	})
+
+
+func _add_setting(name: String, type: int, default: Variant) -> void:
+	if not ProjectSettings.has_setting(name):
+		ProjectSettings.set_setting(name, default)
+	ProjectSettings.set_initial_value(name, default)
+	ProjectSettings.add_property_info({"name": name, "type": type})

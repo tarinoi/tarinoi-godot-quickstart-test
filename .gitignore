@@ -1,0 +1,20 @@
+# macOS
+.DS_Store
+
+# Godot 4+ specific ignores
+.godot/
+/android/
+
+# godot-sqlite platform binaries — install from the godot-sqlite GitHub release (see README)
+addons/godot-sqlite/bin/
+
+# Bindings generated from your own Tarinoi project's schema — created by
+# Tools > Tarinoi: Regenerate Bindings after syncing. Not portable between projects.
+bindings/generated/
+# The core functions scaffold codegen writes beside them derives from those
+# generated classes, so it is just as project-specific. In your own game,
+# bindings/impl/ is exactly what you commit.
+bindings/impl/
+
+# JetBrains IDEs
+/.idea/
